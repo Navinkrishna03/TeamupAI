@@ -29,7 +29,7 @@ mongoose.connect(process.env.MONGO_URI)
 
 // --- GEMINI SETUP ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 const checkAndTrackUsage = async () => {
   const today = new Date().toISOString().split('T')[0];
@@ -44,54 +44,57 @@ const checkAndTrackUsage = async () => {
 // 🚀 ROUTES
 // ==========================================
 
-// 1. REGISTER / LOGIN (User & Admin)
+// 1. REGISTER
 app.post('/api/register', async (req, res) => {
   try {
-    const { email, password, name, skills } = req.body;
-
-    // --- ADMIN LOGIN CHECK ---
+    const { email, password } = req.body;
     if (email === 'admin@teamup.ai') {
       if (password === 'admin@123') {
-        // Find or create admin user dummy entry
         let adminUser = await User.findOne({ email });
         if (!adminUser) {
-            adminUser = new User({ name: 'Administrator', email, skills: ['Admin'] });
+            adminUser = new User({ name: 'Administrator', email, skills: ['Admin'], primaryRole: 'Admin', availabilityHours: 24 });
             await adminUser.save();
         }
         return res.status(200).json({ message: "Welcome Back, Admin.", user: adminUser, isAdmin: true });
-      } else {
-        return res.status(401).json({ error: "Invalid Admin Password." });
-      }
+      } else { return res.status(401).json({ error: "Invalid Admin Password." }); }
     }
-
-    // --- NORMAL USER REGISTRATION ---
     const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ error: "Email already exists." });
-    }
+    if (existingUser) return res.status(200).json({ message: "Welcome back!", user: existingUser });
+    if (!req.body.primaryRole || !req.body.availabilityHours) return res.status(400).json({ error: "Missing fields." });
+
     const newUser = new User(req.body);
     await newUser.save();
     res.status(201).json({ message: "Profile Created", user: newUser });
-  } catch (error) { res.status(500).json({ error: "Error processing request" }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 2. POST IDEA
+// 2. POST IDEA (With Clarity Analysis)
 app.post('/api/ideas', async (req, res) => {
   try {
     await checkAndTrackUsage();
     const { title, problemStatement, expectedOutcome, rolesNeeded, createdBy, tags } = req.body;
     
-    const prompt = `Analyze idea: ${title}. Rate clarity (0-100) & 1 sentence feedback. JSON: {"score": 80, "feedback": "..."}`;
+    // AI Check for Clarity
+    const prompt = `Analyze this hackathon idea. Title: ${title}, Problem: ${problemStatement}, Goal: ${expectedOutcome}. 
+    Rate clarity (0-100) and give 1 short sentence feedback. 
+    Return strictly JSON: {"score": 85, "feedback": "Good detail but specify tech stack."}`;
+    
     const result = await model.generateContent(prompt);
-    const aiAnalysis = JSON.parse(result.response.text().replace(/```json/g, "").replace(/```/g, "").trim());
+    const text = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
+    const aiAnalysis = JSON.parse(text);
 
-    const newIdea = new Idea({ title, problemStatement, expectedOutcome, rolesNeeded, tags, createdBy, clarityScore: aiAnalysis.score });
+    const newIdea = new Idea({ 
+        title, 
+        problemStatement, 
+        expectedOutcome, 
+        rolesNeeded, 
+        tags, 
+        createdBy, 
+        clarityScore: aiAnalysis.score // Storing the score
+    });
     await newIdea.save();
     res.status(201).json({ idea: newIdea, feedback: aiAnalysis.feedback });
-  } catch (error) { 
-    if(error.message === "DAILY_QUOTA_REACHED") return res.status(429).json({ error: "Daily Limit Reached" });
-    res.status(500).json({ error: "Post failed" }); 
-  }
+  } catch (error) { res.status(500).json({ error: "Post failed" }); }
 });
 
 // 3. GET IDEAS
@@ -106,52 +109,105 @@ app.post('/api/apply', async (req, res) => {
   catch (error) { res.status(500).json({ error: "Application failed" }); }
 });
 
-// 5. RISK ANALYSIS
+// 5. ANALYZE RISK (FIXED: NOW CHECKS TEAM MEMBERS)
 app.post('/api/analyze-risk', async (req, res) => {
   try {
     await checkAndTrackUsage();
     const { ideaId } = req.body;
     const idea = await Idea.findById(ideaId);
-    const prompt = `Analyze risk for "${idea.title}". JSON: {"riskLevel": "HIGH", "reason": "Reason"}`;
-    const result = await model.generateContent(prompt);
-    const riskAnalysis = JSON.parse(result.response.text().replace(/```json/g, "").replace(/```/g, "").trim());
     
+    // FETCH REAL TEAM MEMBERS (Accepted Applications)
+    const acceptedApps = await Application.find({ ideaId: ideaId, status: 'accepted' });
+    
+    // If no one is accepted, the team is just the creator (implied) or empty
+    // We map the accepted user IDs to fetch their details (Role/Availability)
+    const members = await User.find({ _id: { $in: acceptedApps.map(a => a.userId) } });
+
+    // Construct the Prompt with REAL data
+    const prompt = `
+      Analyze failure risk for this hackathon team.
+      Project: "${idea.title}".
+      Roles Needed: ${idea.rolesNeeded.map(r => r.roleName).join(', ')}.
+      
+      Current Accepted Team Members:
+      ${members.length > 0 ? members.map(m => `- ${m.primaryRole} (${m.availabilityHours} hrs/day)`).join('\n') : "No members accepted yet (Only Owner)."}
+      
+      Task: Compare "Roles Needed" vs "Current Team".
+      If key roles (like Devs) are missing, Risk is HIGH.
+      If team is full and balanced, Risk is LOW.
+      
+      Return JSON: {"riskLevel": "HIGH" or "MEDIUM" or "LOW", "reason": "Short reason why"}
+    `;
+    
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
+    const riskAnalysis = JSON.parse(text);
+    
+    // Save the result so we don't need to re-run it
     idea.teamRiskAnalysis = riskAnalysis;
     await idea.save();
     res.json(riskAnalysis);
-  } catch (error) { res.status(500).json({ error: "Risk analysis failed" }); }
+  } catch (error) { 
+      console.error(error);
+      res.status(500).json({ error: "Risk analysis failed" }); 
+  }
 });
 
-// --- ADMIN ROUTES ---
-
-// 6. GET ALL DATA
-app.get('/api/admin/data', async (req, res) => {
+// 6. UPDATE PROFILE
+app.put('/api/users/:id', async (req, res) => {
   try {
-    const users = await User.find();
-    const ideas = await Idea.find();
-    res.json({ users, ideas });
+    const updatedUser = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    res.json(updatedUser);
+  } catch (error) { res.status(500).json({ error: "Update failed" }); }
+});
+
+// 7. GET MY APPLICATIONS
+app.get('/api/applications/my/:userId', async (req, res) => {
+  try {
+    const apps = await Application.find({ userId: req.params.userId }).populate('ideaId');
+    res.json(apps);
   } catch (error) { res.status(500).json({ error: "Fetch failed" }); }
 });
 
-// 7. GET STATS
-app.get('/api/admin/stats', async (req, res) => {
+// 8. GET TEAM MEMBERS (Accepted Only)
+app.get('/api/ideas/:id/team', async (req, res) => {
   try {
-    const userCount = await User.countDocuments();
-    const ideaCount = await Idea.countDocuments();
-    const today = new Date().toISOString().split('T')[0];
-    const usage = await Usage.findOne({ date: today });
-    res.json({ users: userCount, ideas: ideaCount, apiCallsToday: usage ? usage.apiCalls : 0 });
-  } catch (error) { res.status(500).json({ error: "Stats failed" }); }
+    const apps = await Application.find({ ideaId: req.params.id, status: 'accepted' });
+    const members = await User.find({ _id: { $in: apps.map(a => a.userId) } });
+    res.json(members);
+  } catch (error) { res.status(500).json({ error: "Fetch failed" }); }
 });
 
-// 8. DELETE DATA
-app.delete('/api/admin/delete/:type/:id', async (req, res) => {
+// 9. MANAGE: GET APPLICANTS
+app.get('/api/applications/idea/:ideaId', async (req, res) => {
   try {
+    const apps = await Application.find({ ideaId: req.params.ideaId });
+    res.json(apps);
+  } catch (error) { res.status(500).json({ error: "Fetch failed" }); }
+});
+
+// 10. MANAGE: ACCEPT/REJECT
+app.put('/api/applications/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body; 
+    const app = await Application.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    res.json(app);
+  } catch (error) { res.status(500).json({ error: "Update failed" }); }
+});
+
+// ADMIN ROUTES
+app.get('/api/admin/stats', async (req, res) => { 
+    const u = await User.countDocuments(); const i = await Idea.countDocuments(); 
+    const usage = await Usage.findOne({ date: new Date().toISOString().split('T')[0] });
+    res.json({ users: u, ideas: i, apiCallsToday: usage?.apiCalls || 0 });
+});
+app.get('/api/admin/data', async (req, res) => { 
+    const users = await User.find(); const ideas = await Idea.find(); res.json({ users, ideas });
+});
+app.delete('/api/admin/delete/:type/:id', async (req, res) => { 
     const { type, id } = req.params;
-    if (type === 'user') { await User.findByIdAndDelete(id); }
-    else if (type === 'idea') { await Idea.findByIdAndDelete(id); }
-    res.json({ message: "Deleted successfully" });
-  } catch (error) { res.status(500).json({ error: "Delete failed" }); }
+    if (type === 'user') await User.findByIdAndDelete(id); else await Idea.findByIdAndDelete(id);
+    res.json({ msg: "Deleted" });
 });
 
 app.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
